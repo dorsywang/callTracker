@@ -10,9 +10,12 @@
  */
 var fs = require('fs');
 
+var babel = require('babel-core');
 var types = require('babel-types');
 var babylon = require('babylon');
 var traverse = require('babel-traverse').default;
+var template = require('babel-template');
+var gen = require('babel-generator').default;
 
 var deepPropery = function(obj, path){
     path = path.split(".");
@@ -24,6 +27,7 @@ var deepPropery = function(obj, path){
 };
 
 var getFunctionExpressionReference = function(path){
+    // functionExpress get Reference
     return deepPropery(path, "parent.id.name");
 };
 
@@ -31,11 +35,38 @@ var getReferenceName = function(path){
     return deepPropery(path, "id.name") || deepPropery(path, "node.id.name")
 };
 
+var getFunctionName = function(path){
+    return deepPropery(path, 'node.id.name');
+}
+
+function addComment(node, type, content, line) {
+  addComments(node, type, [{
+    type: line ? "CommentLine" : "CommentBlock",
+    value: content
+  }]);
+}
+
+function addComments(node, type, comments) {
+  if (!comments) return;
+
+  if (!node) return;
+
+  var key = type + "Comments";
+
+  if (node[key]) {
+    node[key] = node[key].concat(comments);
+  } else {
+    node[key] = comments;
+  }
+}
+
 
 class CallTracker{
     constructor(){
         this.treeResult = new Map()
         this.calledMap = new Map();
+        this.finalResult = new Map();
+        this.callOperator = '-->';
 
         var codes = fs.readFileSync('./test/index.js', {encoding: 'utf-8'});
 
@@ -45,20 +76,100 @@ class CallTracker{
         this.getRefCalledByRefMap();
 
         this.getCalledRelationShip();
+
+        this.addTrackerAsCommentForCodes();
+
+        var code = gen(this.ast, {
+            comments: true
+        });
+
+        console.log(code.code);
+
     }
 
     parseAST(codes){
         var ast = babylon.parse(codes, {
-            sourceType: "module",
-            plugins: [
-                'jsx',
-                'estree'
-            ]
         });
 
         this.ast = ast;
 
         console.log('Code AST:', ast);
+    }
+
+    addTrackerAsCommentForCodes(){
+        var finalResult = this.finalResult;
+       traverse(this.ast, {
+         FunctionDeclaration: {
+                enter(path){
+                    var node = path.node;
+
+                    var id = node.id;
+
+                    var calledString = finalResult.get(node);
+
+                    if(calledString){
+                        var comment = `${calledString}`;
+
+                        /*
+                        var ast = babylon.parse(comment, {
+                            type: 'script'
+                        });
+                        console.log('babylonPase', ast);
+
+                        var gen1 = babel.template(comment);
+                        var ast = gen1({});
+                        */
+
+                        //path.parentPath.addComment("leading", comment);
+
+                        var noopNode = types.noop();
+
+                        path.insertBefore(noopNode);
+
+                        addComment(noopNode, "leading", comment);
+
+
+                    }
+                }
+            },
+
+            VariableDeclarator: {
+                enter(path){
+                    var node = path.node;
+
+                    var id = node.id;
+                    var init = node.init;
+
+                    if(types.isFunctionExpression(init)){
+                        var calledString = finalResult.get(node);
+
+                        if(calledString){
+                            var comment = `${calledString}`;
+
+                            /*
+                            var ast = babylon.parse(comment, {
+                                type: 'script'
+                            });
+                            console.log('babylonPase', ast);
+
+                            var gen1 = babel.template(comment);
+                            var ast = gen1({});
+                            */
+
+                            //path.parentPath.addComment("leading", comment);
+
+                            var noopNode = types.noop();
+
+                            path.parentPath.insertBefore(noopNode);
+
+                            addComment(noopNode, "leading", comment);
+
+
+                        }
+                    }
+                }
+            }
+       });
     }
     
     getRefCalledByRefMap(){
@@ -66,6 +177,35 @@ class CallTracker{
         var calledMap = this.calledMap;
 
         traverse(this.ast, {
+            // function(){}
+            FunctionDeclaration: {
+                enter(path){
+                    var node = path.node;
+
+                    var id = node.id;
+                    //var init = node.init;
+
+                   // if(types.isFunctionExpression(init)){
+
+                        // Function -> [reference A,...]
+                        var callingReferences = treeResult.get(node) || [];
+
+                        console.log('get callingReferences', callingReferences);
+
+                        callingReferences.map(item => {
+                            // calledMap[reference A] = [...]
+                            if(! calledMap.get(item)){
+                                calledMap.set(item, []);
+                            }
+
+                            // reference this -> function -> A -> function
+                            // calledMap[reference A] = [reference this]
+                            calledMap.get(item).push(node);
+                        });
+                    //}
+                }
+            },
+            
             // var a = function(){}
             VariableDeclarator: {
                 enter(path){
@@ -112,12 +252,24 @@ class CallTracker{
                 // 这里是调用代码
                 //console.log(path);
 
+                if(! types.isIdentifier(node.callee)){
+                    //var a = node.callee.evaluate()
+                    //console.log('a', a);
+                    return;
+                }
+
                 // 分析调用function
                 var callingName = node.callee.name;
 
                 // 找到父级function
-                var funcPaths = path.findParent((path) => path.isFunctionExpression());
+                var funcPaths = path.findParent((path) => path.isFunctionExpression() ||  path.isFunctionDeclaration());
+
+                if(! funcPaths){
+                    return;
+                }
+
                 var funcNode = funcPaths.node;
+
 
 
                 // 从scope中找出是哪个function为调用者
@@ -137,10 +289,17 @@ class CallTracker{
                 var callingFunctionReferencePath = callingFunctionReference.path;
                 var callingFunctionReferenceNode = callingFunctionReferencePath.node;
 
-                var callingFunctionName = getReferenceName(callingFunctionReferencePath);
-                var selfReferenceName = getFunctionExpressionReference(funcPaths);
+                var nodeType = callingFunctionReferencePath.node.type;
 
-                console.log("finding Relationship: ", selfReferenceName, '-->', callingName);
+                if(nodeType === 'FunctionExpression'){
+                    var callingFunctionName = getReferenceName(callingFunctionReferencePath);
+                }else if(nodeType === 'FunctionDeclaration'){
+                    var callingFunctionName = getFunctionName(callingFunctionReferencePath);
+                }
+
+                var selfReferenceName = getFunctionExpressionReference(funcPaths) || getFunctionName(funcPaths);
+
+                console.log("finding Relationship: ", selfReferenceName, '-->', callingFunctionName);
 
                 if(! treeResult.get(funcNode)){
                     treeResult.set(funcNode, []);
@@ -157,8 +316,17 @@ class CallTracker{
         });
     }
 
+    transformToString(relation, selfName){
+        return relation.map(item => {
+            return item.map(i => {
+                return getReferenceName(i);
+            }).reverse().join(this.callOperator) + this.callOperator + selfName;
+        }).join('\n');
+    }
+
     getCalledRelationShip(){
         var calledMap = this.calledMap;
+        var finalResult = this.finalResult;
 
         for(var i of calledMap.keys()){
             console.log('start to get callPath');
@@ -196,10 +364,13 @@ class CallTracker{
             };
 
             var r = analizeTrackers(i);
-            console.log(r);
 
             var name = getReferenceName(i);
 
+            var relationString = this.transformToString(r, name);
+            console.log('relationString', relationString);
+
+            finalResult.set(i, relationString);
 
             //console.log('calling', i, calledMap.get(i));
         }
